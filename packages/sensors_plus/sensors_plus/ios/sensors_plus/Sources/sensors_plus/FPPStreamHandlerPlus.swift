@@ -39,15 +39,15 @@ func _initAltimeter() {
     }
 }
 
-let _deviceMotionStreamHandlers = NSHashTable<AnyObject>.weakObjects()
+private let _deviceMotionStreamHandlers = NSHashTable<AnyObject>.weakObjects()
 
-func _currentDeviceMotionStreamHandlers() -> [DeviceMotionStreamHandler] {
+private func _currentDeviceMotionStreamHandlers() -> [DeviceMotionStreamHandler] {
     return _deviceMotionStreamHandlers.allObjects.compactMap {
         $0 as? DeviceMotionStreamHandler
     }
 }
 
-func _preferredDeviceMotionReferenceFrame() -> CMAttitudeReferenceFrame? {
+private func _preferredDeviceMotionReferenceFrame() -> CMAttitudeReferenceFrame? {
     let availableFrames = CMMotionManager.availableAttitudeReferenceFrames()
     if availableFrames.contains(.xArbitraryCorrectedZVertical) {
         return .xArbitraryCorrectedZVertical
@@ -61,7 +61,7 @@ func _preferredDeviceMotionReferenceFrame() -> CMAttitudeReferenceFrame? {
     return nil
 }
 
-func _syncDeviceMotionUpdates() {
+private func _syncDeviceMotionUpdates() {
     _initMotionManager()
     let handlers = _currentDeviceMotionStreamHandlers()
 
