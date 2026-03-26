@@ -15,6 +15,12 @@ public protocol MotionStreamHandler: FlutterStreamHandler {
     var samplingPeriod: Int { get set }
 }
 
+private protocol DeviceMotionStreamHandler: MotionStreamHandler {
+    var eventSink: FlutterEventSink? { get set }
+    var showsDeviceMovementDisplay: Bool { get }
+    func handleDeviceMotion(_ data: CMDeviceMotion, sink: @escaping FlutterEventSink)
+}
+
 let timestampMicroAtBoot = (Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime) * 1000000
 
 func _initMotionManager() {
@@ -30,6 +36,79 @@ func _initMotionManager() {
 func _initAltimeter() {
     if (_altimeter == nil) {
         _altimeter = CMAltimeter()
+    }
+}
+
+let _deviceMotionStreamHandlers = NSHashTable<AnyObject>.weakObjects()
+
+func _currentDeviceMotionStreamHandlers() -> [DeviceMotionStreamHandler] {
+    return _deviceMotionStreamHandlers.allObjects.compactMap {
+        $0 as? DeviceMotionStreamHandler
+    }
+}
+
+func _preferredDeviceMotionReferenceFrame() -> CMAttitudeReferenceFrame? {
+    let availableFrames = CMMotionManager.availableAttitudeReferenceFrames()
+    if availableFrames.contains(.xArbitraryCorrectedZVertical) {
+        return .xArbitraryCorrectedZVertical
+    }
+    if availableFrames.contains(.xMagneticNorthZVertical) {
+        return .xMagneticNorthZVertical
+    }
+    if availableFrames.contains(.xTrueNorthZVertical) {
+        return .xTrueNorthZVertical
+    }
+    return nil
+}
+
+func _syncDeviceMotionUpdates() {
+    _initMotionManager()
+    let handlers = _currentDeviceMotionStreamHandlers()
+
+    guard !handlers.isEmpty else {
+        _motionManager.stopDeviceMotionUpdates()
+        return
+    }
+
+    let samplingPeriod = handlers.map(\.samplingPeriod).min() ?? 200000
+    _motionManager.deviceMotionUpdateInterval = Double(samplingPeriod) * 0.000001
+    _motionManager.showsDeviceMovementDisplay = handlers.contains { $0.showsDeviceMovementDisplay }
+
+    if _motionManager.isDeviceMotionActive {
+        return
+    }
+
+    let queue = OperationQueue()
+    let handler: CMDeviceMotionHandler = { data, error in
+        if _isCleanUp {
+            return
+        }
+        let activeHandlers = _currentDeviceMotionStreamHandlers()
+        if let error {
+            activeHandlers.forEach { streamHandler in
+                streamHandler.eventSink?(FlutterError(
+                    code: "UNAVAILABLE",
+                    message: error.localizedDescription,
+                    details: nil
+                ))
+            }
+            return
+        }
+        guard let data else {
+            return
+        }
+        activeHandlers.forEach { streamHandler in
+            guard let sink = streamHandler.eventSink else {
+                return
+            }
+            streamHandler.handleDeviceMotion(data, sink: sink)
+        }
+    }
+
+    if let referenceFrame = _preferredDeviceMotionReferenceFrame() {
+        _motionManager.startDeviceMotionUpdates(using: referenceFrame, to: queue, withHandler: handler)
+    } else {
+        _motionManager.startDeviceMotionUpdates(to: queue, withHandler: handler)
     }
 }
 
@@ -98,12 +177,14 @@ class FPPAccelerometerStreamHandlerPlus: NSObject, MotionStreamHandler {
     }
 }
 
-class FPPUserAccelStreamHandlerPlus: NSObject, MotionStreamHandler {
+class FPPUserAccelStreamHandlerPlus: NSObject, DeviceMotionStreamHandler {
+
+    var eventSink: FlutterEventSink?
+    let showsDeviceMovementDisplay = false
 
     var samplingPeriod = 200000 {
         didSet {
-            _initMotionManager()
-            _motionManager.deviceMotionUpdateInterval = Double(samplingPeriod) * 0.000001
+            _syncDeviceMotionUpdates()
         }
     }
 
@@ -111,36 +192,29 @@ class FPPUserAccelStreamHandlerPlus: NSObject, MotionStreamHandler {
             withArguments arguments: Any?,
             eventSink sink: @escaping FlutterEventSink
     ) -> FlutterError? {
-        _initMotionManager()
-        _motionManager.startDeviceMotionUpdates(to: OperationQueue()) { data, error in
-            if _isCleanUp {
-                return
-            }
-            if (error != nil) {
-                sink(FlutterError.init(
-                        code: "UNAVAILABLE",
-                        message: error!.localizedDescription,
-                        details: nil
-                ))
-                return
-            }
-            // Multiply by gravity, and adjust sign values to
-            // align with Android.
-            let acceleration = data!.userAcceleration
-            sendFlutter(
-                    x: -acceleration.x * GRAVITY,
-                    y: -acceleration.y * GRAVITY,
-                    z: -acceleration.z * GRAVITY,
-                    timestamp: data!.timestamp,
-                    sink: sink
-            )
-        }
+        eventSink = sink
+        _deviceMotionStreamHandlers.add(self)
+        _syncDeviceMotionUpdates()
         return nil
     }
 
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        _motionManager.stopDeviceMotionUpdates()
+        eventSink = nil
+        _deviceMotionStreamHandlers.remove(self)
+        _syncDeviceMotionUpdates()
         return nil
+    }
+
+    func handleDeviceMotion(_ data: CMDeviceMotion, sink: @escaping FlutterEventSink) {
+        // Multiply by gravity, and adjust sign values to align with Android.
+        let acceleration = data.userAcceleration
+        sendFlutter(
+                x: -acceleration.x * GRAVITY,
+                y: -acceleration.y * GRAVITY,
+                z: -acceleration.z * GRAVITY,
+                timestamp: data.timestamp,
+                sink: sink
+        )
     }
 
     func dealloc() {
@@ -196,12 +270,14 @@ class FPPGyroscopeStreamHandlerPlus: NSObject, MotionStreamHandler {
     }
 }
 
-class FPPMagnetometerStreamHandlerPlus: NSObject, MotionStreamHandler {
+class FPPMagnetometerStreamHandlerPlus: NSObject, DeviceMotionStreamHandler {
+
+    var eventSink: FlutterEventSink?
+    let showsDeviceMovementDisplay = true
 
     var samplingPeriod = 200000 {
         didSet {
-            _initMotionManager()
-            _motionManager.magnetometerUpdateInterval = Double(samplingPeriod) * 0.000001
+            _syncDeviceMotionUpdates()
         }
     }
 
@@ -209,34 +285,28 @@ class FPPMagnetometerStreamHandlerPlus: NSObject, MotionStreamHandler {
             withArguments arguments: Any?,
             eventSink sink: @escaping FlutterEventSink
     ) -> FlutterError? {
-        _initMotionManager()
-        _motionManager.startMagnetometerUpdates(to: OperationQueue()) { data, error in
-            if _isCleanUp {
-                return
-            }
-            if (error != nil) {
-                sink(FlutterError(
-                        code: "UNAVAILABLE",
-                        message: error!.localizedDescription,
-                        details: nil
-                ))
-                return
-            }
-            let magneticField = data!.magneticField
-            sendFlutter(
-                x: magneticField.x,
-                y: magneticField.y,
-                z: magneticField.z,
-                timestamp: data!.timestamp,
-                sink: sink
-            )
-        }
+        eventSink = sink
+        _deviceMotionStreamHandlers.add(self)
+        _syncDeviceMotionUpdates()
         return nil
     }
 
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        _motionManager.stopDeviceMotionUpdates()
+        eventSink = nil
+        _deviceMotionStreamHandlers.remove(self)
+        _syncDeviceMotionUpdates()
         return nil
+    }
+
+    func handleDeviceMotion(_ data: CMDeviceMotion, sink: @escaping FlutterEventSink) {
+        let magneticField = data.magneticField.field
+        sendFlutter(
+            x: magneticField.x,
+            y: magneticField.y,
+            z: magneticField.z,
+            timestamp: data.timestamp,
+            sink: sink
+        )
     }
 
     func dealloc() {
